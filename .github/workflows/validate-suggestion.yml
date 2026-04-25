@@ -1,0 +1,96 @@
+﻿name: 🤖 Bot — Validate & Merge Repo Suggestion
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+    paths:
+      - "suggestions/*.md"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Validate and process suggestion
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const prNumber = pr.number;
+            const suggDir = "suggestions";
+            const files = fs.readdirSync(suggDir).filter(f => f.endsWith(".md") && f !== "EXAMPLE-delete-this.md");
+            if (files.length === 0) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — the bot couldn't find a suggestion file.`, ``, `Make sure your file is in the \`suggestions/\` folder and ends with \`.md\`.`, ``, `Format: \`suggestions/owner-reponame.md\``, ``, `*Closing this PR. Open a new one with the correct file location.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            const suggFile = path.join(suggDir, files[0]);
+            const content = fs.readFileSync(suggFile, "utf8");
+            const urlMatch = content.match(/https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)/);
+            if (!urlMatch) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — the bot couldn't find a valid GitHub repo URL.`, ``, `**Expected:** \`https://github.com/owner/repo-name\``, ``, `*Closing this PR.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            const repoOwner = urlMatch[1];
+            const repoName = urlMatch[2];
+            const repoFullName = `${repoOwner}/${repoName}`;
+            const dataFile = "data/repos.json";
+            let existing = [];
+            if (fs.existsSync(dataFile)) existing = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+            if (existing.find(r => r.full_name.toLowerCase() === repoFullName.toLowerCase())) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — **${repoFullName}** is already listed! 🎉`, ``, `*Closing this duplicate PR.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            let repoData;
+            try {
+              const resp = await github.rest.repos.get({ owner: repoOwner, repo: repoName });
+              repoData = resp.data;
+            } catch (e) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — couldn't find **${repoFullName}** on GitHub. Make sure the URL is correct and the repo is public.`, ``, `*Closing this PR.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            if (repoOwner.toLowerCase() === author.toLowerCase()) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — you can't suggest your own repo. That's rule #1.`, ``, `*Closing this PR.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            const failures = [];
+            const passes = [];
+            try { await github.rest.repos.getReadme({ owner: repoOwner, repo: repoName }); passes.push("✅ Has a README"); } catch { failures.push("❌ **No README**"); }
+            try { await github.rest.repos.getContent({ owner: repoOwner, repo: repoName, path: "CONTRIBUTING.md" }); passes.push("✅ Has CONTRIBUTING.md"); } catch { try { await github.rest.repos.getContent({ owner: repoOwner, repo: repoName, path: ".github/CONTRIBUTING.md" }); passes.push("✅ Has CONTRIBUTING.md"); } catch { failures.push("❌ **No CONTRIBUTING.md**"); } }
+            if (repoData.license) { passes.push(`✅ Has license (${repoData.license.spdx_id})`); } else { failures.push("❌ **No OSS license**"); }
+            let contributorCount = 0;
+            try { const c = await github.rest.repos.listContributors({ owner: repoOwner, repo: repoName, per_page: 100 }); contributorCount = c.data.length; if (contributorCount >= 10) { passes.push(`✅ ${contributorCount}+ contributors`); } else { failures.push(`❌ **Only ${contributorCount} contributors** — needs 10+`); } } catch { failures.push("❌ **Couldn't fetch contributors**"); }
+            const daysSince = Math.floor((Date.now() - new Date(repoData.pushed_at)) / 86400000);
+            if (daysSince <= 90) { passes.push(`✅ Active — last commit ${daysSince} days ago`); } else { failures.push(`❌ **Inactive** — ${daysSince} days since last commit (needs < 90)`); }
+            let goodFirstIssues = [];
+            try { const iss = await github.rest.issues.listForRepo({ owner: repoOwner, repo: repoName, labels: "good first issue", state: "open", per_page: 10 }); goodFirstIssues = iss.data.filter(i => !i.pull_request); if (goodFirstIssues.length > 0) { passes.push(`✅ ${goodFirstIssues.length} open good first issues`); } else { failures.push(`❌ **No open good first issues**`); } } catch { failures.push(`❌ **No good first issue label**`); }
+            if (failures.length > 0) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — **${repoFullName}** didn't pass validation.`, ``, `### ❌ Failed`, failures.join("\n"), ``, passes.length > 0 ? `### ✅ Passed\n${passes.join("\n")}` : "", ``, `---`, `These checks protect beginners. Fix the issues above and suggest again.`, ``, `*Closing this PR.*`].join("\n") });
+              await github.rest.pulls.update({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, state: "closed" });
+              return;
+            }
+            const whyMatch = content.match(/Why is this beginner-friendly\?[^\n]*\n+([^#\n][^\n]*(?:\n(?![#\-])[^\n]*)*)/);
+            const whyText = whyMatch ? whyMatch[1].trim().slice(0, 200) : "Manually verified as beginner-friendly.";
+            existing.push({ full_name: repoFullName, name: repoData.name, owner: repoOwner, url: repoData.html_url, description: repoData.description || "", language: repoData.language || "Unknown", stars: repoData.stargazers_count, forks: repoData.forks_count, open_issues: repoData.open_issues_count, good_first_issues: goodFirstIssues.length, good_first_issue_links: goodFirstIssues.slice(0, 3).map(i => ({ title: i.title, url: i.html_url })), contributors: contributorCount, last_commit_days: daysSince, license: repoData.license ? repoData.license.spdx_id : null, why: whyText, added_by: author, added_at: new Date().toISOString().split("T")[0], verified: true });
+            fs.writeFileSync(dataFile, JSON.stringify(existing, null, 2));
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body: [`Hey @${author} — **${repoFullName}** passed all checks! 🎉`, ``, `### ✅ Validation`, passes.join("\n"), ``, `Merging now. Site rebuilds automatically — live in minutes.`, ``, `Thanks! 👋`].join("\n") });
+            try { await github.rest.pulls.merge({ owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, commit_title: `feat: add ${repoFullName} [bot]`, merge_method: "squash" }); } catch (e) { console.log("Merge failed:", e.message); }
